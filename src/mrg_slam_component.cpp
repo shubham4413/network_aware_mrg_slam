@@ -1,0 +1,1484 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+#include <Eigen/Dense>
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+// boost
+#include <boost/algorithm/string.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/format.hpp>
+#include <boost/thread.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+// g2o
+#include <g2o/types/slam3d/edge_se3.h>
+#include <g2o/types/slam3d/vertex_se3.h>
+
+#include <g2o/edge_se3_plane.hpp>
+#include <g2o/edge_se3_priorxy.hpp>
+#include <g2o/edge_se3_priorxyz.hpp>
+// mrg_slam
+#include <mrg_slam/edge.hpp>
+#include <mrg_slam/floor_coeffs_processor.hpp>
+#include <mrg_slam/gps_processor.hpp>
+#include <mrg_slam/graph_database.hpp>
+#include <mrg_slam/graph_slam.hpp>
+#include <mrg_slam/imu_processor.hpp>
+#include <mrg_slam/keyframe.hpp>
+#include <mrg_slam/keyframe_updater.hpp>
+#include <mrg_slam/loop_detector.hpp>
+#include <mrg_slam/map_cloud_generator.hpp>
+#include <mrg_slam/markers_publisher.hpp>
+#include <mrg_slam/ros_utils.hpp>
+#include <mrg_slam_msgs/msg/graph_ros.hpp>
+#include <mrg_slam_msgs/msg/pose_with_name.hpp>
+#include <mrg_slam_msgs/msg/pose_with_name_array.hpp>
+#include <mrg_slam_msgs/msg/slam_status.hpp>
+#include <mrg_slam_msgs/srv/add_static_key_frames.hpp>
+#include <mrg_slam_msgs/srv/get_graph_uuids.hpp>
+#include <mrg_slam_msgs/srv/load_graph.hpp>
+#include <mrg_slam_msgs/srv/publish_graph.hpp>
+#include <mrg_slam_msgs/srv/publish_map.hpp>
+#include <mrg_slam_msgs/srv/request_graphs.hpp>
+#include <mrg_slam_msgs/srv/save_graph.hpp>
+#include <mrg_slam_msgs/srv/save_map.hpp>
+// pcl
+#include <pcl/filters/extract_indices.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl_conversions/pcl_conversions.h>
+// adaptive bandwidth-aware cloud compression at transmission time
+#include "adaptive_cloud_transmitter.hpp"
+// ROS2
+#include <angles/angles.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/time_synchronizer.h>
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+
+namespace mrg_slam {
+class MrgSlamComponent : public rclcpp::Node {
+public:
+    typedef pcl::PointXYZI                                                                                          PointT;
+    typedef message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry, sensor_msgs::msg::PointCloud2> ApproxSyncPolicy;
+
+    MrgSlamComponent( const rclcpp::NodeOptions &options ) :
+        Node( "mrg_slam_component", options ),
+        trans_odom2map_( Eigen::Isometry3d::Identity() ),
+        map_cloud_msg_( std::make_shared<sensor_msgs::msg::PointCloud2>() ),
+        map_cloud_msg_update_required_( false )
+    {
+        // Since we need to pass the shared pointer from this node to other classes and functions, we start a one-shot timer to call the
+        // onInit() method
+        one_shot_initalization_timer_ = create_wall_timer( std::chrono::milliseconds( 100 ), std::bind( &MrgSlamComponent::onInit, this ) );
+    }
+    virtual ~MrgSlamComponent() {}
+
+    // Initialize the component
+    virtual void onInit()
+    {
+        RCLCPP_INFO( get_logger(), "Initializing mrg_slam component..." );
+        // Deactivate this timer immediately so the initialization is only performed once
+        one_shot_initalization_timer_->cancel();
+
+        initialize_params();
+
+        graph_slam_.reset( new GraphSLAM( get_parameter( "g2o_solver_type" ).as_string() ) );
+        graph_slam_->set_save_graph( get_parameter( "save_graph" ).as_bool() );
+
+        graph_database_.reset( new GraphDatabase( shared_from_this(), graph_slam_ ) );
+        keyframe_updater_.reset( new KeyframeUpdater( shared_from_this() ) );
+        loop_detector_.reset( new LoopDetector( shared_from_this() ) );
+        map_cloud_generator_.reset( new MapCloudGenerator() );
+        cloud_transmitter_ = std::make_shared<AdaptiveCloudTransmitter>( this, own_name_ );
+
+        // subscribers
+        odom_sub_.subscribe( shared_from_this(), "scan_matching_odometry/odom", rmw_qos_profile_default );
+        cloud_sub_.subscribe( shared_from_this(), "prefiltering/filtered_points", rmw_qos_profile_default );
+        sync_.reset( new message_filters::Synchronizer<ApproxSyncPolicy>( ApproxSyncPolicy( 32 ), odom_sub_, cloud_sub_ ) );
+        sync_->registerCallback( std::bind( &MrgSlamComponent::cloud_callback, this, std::placeholders::_1, std::placeholders::_2 ) );
+
+        // broadcast subscriptions, note that the topic is absolute and not potentially prefixed with the robot name/namespace
+        odom_broadcast_sub_ = create_subscription<mrg_slam_msgs::msg::PoseWithName>( "/mrg_slam/odom_broadcast", rclcpp::QoS( 100 ),
+                                                                                     std::bind( &MrgSlamComponent::odom_broadcast_callback,
+                                                                                                this, std::placeholders::_1 ) );
+
+        // Use a reentrant callbackgroup for odom_broadcast_sub_ to avoid deadlock, enabling the publish graph service to be called from the
+        // same thread as the slam_pose_broadcast_callback
+        rclcpp::SubscriptionOptions      sub_options;
+        rclcpp::CallbackGroup::SharedPtr reentrant_callback_group = create_callback_group( rclcpp::CallbackGroupType::Reentrant );
+        sub_options.callback_group                                = reentrant_callback_group;
+        slam_pose_broadcast_sub_                                  = create_subscription<mrg_slam_msgs::msg::PoseWithName>(
+            "/mrg_slam/slam_pose_broadcast", rclcpp::QoS( 100 ),
+            std::bind( &MrgSlamComponent::slam_pose_broadcast_callback, this, std::placeholders::_1 ), sub_options );
+
+        // publish graph service clients for all other robots participating in the multi-robot SLAM
+        for( const auto &robot_name : multi_robot_names_ ) {
+            if( robot_name != own_name_ ) {
+                std::string service_topic = "/mrg_slam/publish_graph";
+                if( !robot_name.empty() ) {
+                    service_topic = "/" + robot_name + service_topic;
+                }
+                request_graph_service_clients_[robot_name] = create_client<mrg_slam_msgs::srv::PublishGraph>(
+                    service_topic, rmw_qos_profile_services_default, reentrant_callback_group );
+                RCLCPP_INFO_STREAM( get_logger(),
+                                    "Creating publish graph service client for " << robot_name << " with topic " << service_topic );
+                others_last_accum_dist_[robot_name]          = -1.0;
+                others_last_graph_exchange_time_[robot_name] = -1.0;
+            }
+        }
+
+        std::string init_odom_topic = get_parameter( "init_odom_topic" ).as_string();
+        std::string init_pose_topic = get_parameter( "init_pose_topic" ).as_string();
+        if( init_odom_topic != "NONE" ) {
+            init_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>( init_odom_topic, rclcpp::QoS( 32 ),
+                                                                           std::bind( &MrgSlamComponent::init_odom_callback, this,
+                                                                                      std::placeholders::_1 ) );
+            RCLCPP_INFO_STREAM( get_logger(), "Subscribing to init_odom (nav_msgs::msg::Odometry) topic " << init_odom_topic );
+        } else if( init_pose_topic != "NONE" ) {
+            init_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>( init_pose_topic, rclcpp::QoS( 32 ),
+                                                                                   std::bind( &MrgSlamComponent::init_pose_callback, this,
+                                                                                              std::placeholders::_1 ) );
+            RCLCPP_INFO_STREAM( get_logger(), "Subscribing to init_pose (geometry_msgs::msg::PoseStamped) topic " << init_pose_topic );
+        }
+
+        // publishers
+        // broadcast topics, note that the topic is absolute and not prefixed with the robot namespace
+        odom_broadcast_pub_      = create_publisher<mrg_slam_msgs::msg::PoseWithName>( "/mrg_slam/odom_broadcast", rclcpp::QoS( 16 ) );
+        slam_pose_broadcast_pub_ = create_publisher<mrg_slam_msgs::msg::PoseWithName>( "/mrg_slam/slam_pose_broadcast", rclcpp::QoS( 16 ) );
+        // robot specific topics
+        odom2map_pub_           = create_publisher<geometry_msgs::msg::TransformStamped>( "mrg_slam/odom2map", 16 );
+        map_points_timer_pub_   = create_publisher<sensor_msgs::msg::PointCloud2>( "mrg_slam/map_points", rclcpp::QoS( 1 ) );
+        map_points_service_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>( "mrg_slam/map_points_service", rclcpp::QoS( 1 ) );
+        others_poses_pub_       = create_publisher<mrg_slam_msgs::msg::PoseWithNameArray>( "mrg_slam/others_poses", rclcpp::QoS( 16 ) );
+        other_robots_removed_points_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>( "mrg_slam/other_robots_removed_points",
+                                                                                            rclcpp::QoS( 1 ) );
+
+        // Create another reentrant callback group for the slam_status_publisher_ and all callbacks it publishes from
+        rclcpp::PublisherOptions         pub_options;
+        rclcpp::CallbackGroup::SharedPtr reentrant_callback_group2 = create_callback_group( rclcpp::CallbackGroupType::Reentrant );
+        pub_options.callback_group                                 = reentrant_callback_group2;
+        slam_status_publisher_ = create_publisher<mrg_slam_msgs::msg::SlamStatus>( "mrg_slam/slam_status", rclcpp::QoS( 16 ), pub_options );
+
+        optimization_timer_ = rclcpp::create_timer( shared_from_this(), get_clock(),
+                                                    rclcpp::Duration::from_seconds( get_parameter( "graph_update_interval" ).as_double() ),
+                                                    std::bind( &MrgSlamComponent::optimization_timer_callback, this ),
+                                                    reentrant_callback_group2 );
+        map_publish_timer_  = rclcpp::create_timer( shared_from_this(), get_clock(),
+                                                    rclcpp::Duration::from_seconds(
+                                                       get_parameter( "map_cloud_update_interval" ).as_double() ),
+                                                    std::bind( &MrgSlamComponent::map_points_publish_timer_callback, this ) );
+
+        // Add static map service
+        add_static_keyframes_service_ = create_service<mrg_slam_msgs::srv::AddStaticKeyFrames>(
+            "mrg_slam/add_static_keyframes",
+            std::bind( &MrgSlamComponent::add_static_keyframes_service, this, std::placeholders::_1, std::placeholders::_2 ) );
+        // Save graph service
+        save_graph_service_ = create_service<mrg_slam_msgs::srv::SaveGraph>( "mrg_slam/save_graph",
+                                                                             std::bind( &MrgSlamComponent::save_graph_service, this,
+                                                                                        std::placeholders::_1, std::placeholders::_2 ) );
+        // Load graph service
+        load_graph_service_ = create_service<mrg_slam_msgs::srv::LoadGraph>( "mrg_slam/load_graph",
+                                                                             std::bind( &MrgSlamComponent::load_graph_service, this,
+                                                                                        std::placeholders::_1, std::placeholders::_2 ) );
+        // Save map service
+        save_map_service_ = create_service<mrg_slam_msgs::srv::SaveMap>( "mrg_slam/save_map",
+                                                                         std::bind( &MrgSlamComponent::save_map_service, this,
+                                                                                    std::placeholders::_1, std::placeholders::_2 ) );
+        // Publish map service
+        publish_map_service_ = create_service<mrg_slam_msgs::srv::PublishMap>( "mrg_slam/publish_map",
+                                                                               std::bind( &MrgSlamComponent::publish_map_service, this,
+                                                                                          std::placeholders::_1, std::placeholders::_2 ) );
+        // Publish graph service
+        publish_graph_service_ = create_service<mrg_slam_msgs::srv::PublishGraph>( "mrg_slam/publish_graph",
+                                                                                   std::bind( &MrgSlamComponent::publish_graph_service,
+                                                                                              this, std::placeholders::_1,
+                                                                                              std::placeholders::_2 ) );
+        // Request graphs service
+        request_graph_service_ = create_service<mrg_slam_msgs::srv::RequestGraphs>( "mrg_slam/request_graph",
+                                                                                    std::bind( &MrgSlamComponent::request_graph_service,
+                                                                                               this, std::placeholders::_1,
+                                                                                               std::placeholders::_2 ) );
+        // Get graph uuids service
+        get_graph_uuids_service_ = create_service<mrg_slam_msgs::srv::GetGraphUuids>( "mrg_slam/get_graph_uuids",
+                                                                                      std::bind( &MrgSlamComponent::get_graph_uuids_service,
+                                                                                                 this, std::placeholders::_1,
+                                                                                                 std::placeholders::_2 ) );
+
+        // Initialize all processors
+        gps_processor_.onInit( shared_from_this() );
+        imu_processor_.onInit( shared_from_this() );
+        floor_coeffs_processor_.onInit( shared_from_this() );
+        markers_pub.onInit( shared_from_this() );
+
+        slam_status_msg_.initialized = true;
+        slam_status_msg_.robot_name  = own_name_;
+        slam_status_publisher_->publish( slam_status_msg_ );
+
+        // Print the all parameters declared in this node so far
+        print_ros2_parameters( get_node_parameters_interface(), get_logger() );
+    }
+
+private:
+    void initialize_params()
+    {
+        // General and scenario parameters
+        own_name_          = declare_parameter<std::string>( "own_name", "atlas" );
+        multi_robot_names_ = declare_parameter<std::vector<std::string>>( "multi_robot_names", { "atlas", "bestla" } );
+
+        // Map parameters
+        map_frame_id_  = declare_parameter<std::string>( "map_frame_id", "map" );
+        odom_frame_id_ = declare_parameter<std::string>( "odom_frame_id", "odom" );
+        declare_parameter<double>( "map_cloud_resolution", 0.05 );
+        declare_parameter<int>( "map_cloud_min_points_per_voxel", 2 );
+        declare_parameter<double>( "map_cloud_distance_far_thresh", 10000.0 );
+
+        // Initial pose parameters
+        declare_parameter<std::string>( "init_odom_topic", "NONE" );
+        declare_parameter<std::string>( "init_pose_topic", "NONE" );
+        declare_parameter<std::vector<double>>( "init_pose", std::vector<double>{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } );
+
+        // Removing points of other robots from point cloud
+        declare_parameter<double>( "robot_remove_points_radius", 2.0 );
+
+        // GraphSLAM parameters
+        declare_parameter<std::string>( "g2o_solver_type", "lm_var_cholmod" );
+        declare_parameter<int>( "g2o_solver_num_iterations", 1024 );
+        declare_parameter<bool>( "save_graph", true );
+        declare_parameter<bool>( "g2o_verbose", false );
+        declare_parameter<double>( "graph_update_interval", 3.0 );
+        declare_parameter<double>( "map_cloud_update_interval", 10.0 );
+        declare_parameter<double>( "graph_request_min_accum_dist", 3.0 );
+        declare_parameter<double>( "graph_request_max_robot_dist", 10.0 );
+        declare_parameter<double>( "graph_request_min_time_delay", 5.0 );
+        declare_parameter<std::string>( "graph_exchange_mode", "PATH_PROXIMITY" );
+
+        // Fill first cloud parameters
+        declare_parameter<bool>( "enable_fill_first_cloud", false );
+        declare_parameter<double>( "fill_first_cloud_radius", 5.0 );
+        declare_parameter<bool>( "fill_first_cloud_simple", false );
+
+        // GraphDatabase parameters (not directly used by this class)
+        declare_parameter<bool>( "use_custom_inf_matrix_first_node", false );
+        declare_parameter<std::vector<double>>( "custom_inf_matrix_first_node_stddev",
+                                                std::vector<double>{ 4.0, 4.0, 4.0, angles::from_degrees( 23 ), angles::from_degrees( 23 ),
+                                                                     angles::from_degrees( 23 ) } );
+        declare_parameter<int>( "max_keyframes_per_update", 10 );
+        declare_parameter<std::string>( "odometry_edge_robust_kernel", "NONE" );
+        declare_parameter<double>( "odometry_edge_robust_kernel_size", 1.0 );
+        declare_parameter<std::string>( "loop_closure_edge_robust_kernel", "Huber" );
+        declare_parameter<double>( "loop_closure_edge_robust_kernel_size", 1.0 );
+        declare_parameter<std::string>( "result_dir", "" );
+
+        // KeyframeUpdater parameters (not directly used by this class)
+        declare_parameter<double>( "keyframe_delta_trans", 2.0 );
+        declare_parameter<double>( "keyframe_delta_angle", 2.0 );
+
+        // LoopDetector parameters (not directly used by this class)
+        declare_parameter<double>( "candidate_max_xy_distance", 5.0 );
+        declare_parameter<double>( "accum_distance_thresh_same_robot", 8.0 );
+        declare_parameter<double>( "accum_distance_thresh_other_robot", 7.5 );
+        declare_parameter<double>( "fitness_score_max_range", std::numeric_limits<double>::max() );
+        declare_parameter<double>( "fitness_score_thresh", 0.5 );
+        declare_parameter<bool>( "use_planar_registration_guess", false );
+        declare_parameter<bool>( "enable_loop_closure_consistency_check", true );
+        declare_parameter<double>( "loop_closure_consistency_max_delta_trans", 0.25 );
+        declare_parameter<double>( "loop_closure_consistency_max_delta_angle", 5 );
+
+        // Loop closure (scan matching registration LoopDetector) parameters (not directly used by this class)
+        declare_parameter<std::string>( "registration_method", "FAST_GICP" );
+        declare_parameter<int>( "reg_num_threads", 0 );
+        declare_parameter<double>( "reg_transformation_epsilon", 0.1 );
+        declare_parameter<int>( "reg_maximum_iterations", 64 );
+        declare_parameter<double>( "reg_max_correspondence_distance", 2.0 );
+        declare_parameter<int>( "reg_max_optimizer_iterations", 20 );
+        declare_parameter<bool>( "reg_use_reciprocal_correspondences", false );
+        declare_parameter<int>( "reg_correspondence_randomness", 20 );
+        declare_parameter<double>( "reg_resolution", 1.0 );
+        declare_parameter<std::string>( "reg_nn_search_method", "DIRECT7" );
+
+        // InformationMatrixCalculator parameters (not directly used by this class)
+        declare_parameter<bool>( "use_const_inf_matrix", false );
+        declare_parameter<double>( "const_stddev_x", 0.5 );
+        declare_parameter<double>( "const_stddev_q", 0.1 );
+        declare_parameter<double>( "var_gain_a", 20.0 );
+        declare_parameter<double>( "min_stddev_x", 0.1 );
+        declare_parameter<double>( "max_stddev_x", 5.0 );
+        declare_parameter<double>( "min_stddev_q", 0.05 );
+        declare_parameter<double>( "max_stddev_q", 0.2 );
+        // declare_parameter<double>( "fitness_score_thresh", 0.5 ); // already declared for LoopDetector
+
+        // GpsProcessor parameters (not directly used by this class)
+        declare_parameter<bool>( "enable_gps", true );
+        declare_parameter<double>( "gps_time_offset", 0.0 );
+        declare_parameter<double>( "gps_edge_stddev_xy", 10000.0 );
+        declare_parameter<double>( "gps_edge_stddev_z", 10.0 );
+        declare_parameter<std::string>( "gps_edge_robust_kernel", "NONE" );
+        declare_parameter<double>( "gps_edge_robust_kernel_size", 1.0 );
+        declare_parameter<bool>( "gps_use_enu", false );
+        declare_parameter<bool>( "gps_enu_origin_from_msg", true );
+        declare_parameter<std::vector<double>>( "gps_enu_origin", std::vector<double>{} );
+
+        // ImuProcessor parameters (not directly used by this class)
+        declare_parameter<double>( "imu_time_offset", 0.0 );
+        declare_parameter<bool>( "enable_imu_orientation", false );
+        declare_parameter<bool>( "enable_imu_acceleration", false );
+        declare_parameter<double>( "imu_orientation_edge_stddev", 0.1 );
+        declare_parameter<double>( "imu_acceleration_edge_stddev", 3.0 );
+        declare_parameter<std::string>( "imu_orientation_edge_robust_kernel", "NONE" );
+        declare_parameter<std::string>( "imu_acceleration_edge_robust_kernel", "NONE" );
+        declare_parameter<double>( "imu_orientation_edge_robust_kernel_size", 1.0 );
+        declare_parameter<double>( "imu_acceleration_edge_robust_kernel_size", 1.0 );
+
+        // FloorCoeffsProcessor parameters (not directly used by this class)
+        declare_parameter<bool>( "enable_floor_coeffs", false );
+        declare_parameter<double>( "floor_edge_stddev", 10.0 );
+        declare_parameter<std::string>( "floor_edge_robust_kernel", "NONE" );
+        declare_parameter<double>( "floor_edge_robust_kernel_size", 1.0 );
+    }
+
+    /**
+     * @brief received point clouds + odometry are added to the keyframe_queue of the graph_database
+     * @param odom_msg
+     * @param cloud_msg
+     */
+    void cloud_callback( nav_msgs::msg::Odometry::ConstSharedPtr odom_msg, sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg )
+    {
+        const builtin_interfaces::msg::Time &stamp = cloud_msg->header.stamp;
+        Eigen::Isometry3d                    odom  = odom2isometry( odom_msg );
+
+        if( base_frame_id_.empty() ) {
+            base_frame_id_ = cloud_msg->header.frame_id;
+        }
+
+        bool   update_required = keyframe_updater_->update( odom );
+        double accum_d         = keyframe_updater_->get_accum_distance();
+
+        if( update_required ) {
+            pcl::PointCloud<PointT>::Ptr cloud( new pcl::PointCloud<PointT>() );
+            pcl::fromROSMsg( *cloud_msg, *cloud );
+            sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg_filtered = cloud_msg;
+
+            // get poses of other robots and remove corresponding points
+            Eigen::Isometry3d            map2odom;
+            std::vector<Eigen::Vector3d> others_positions;
+            {
+                std::lock_guard<std::mutex> lock( trans_odom2map_mutex_ );
+                if( trans_odom2map_.isApprox( Eigen::Isometry3d::Identity() ) ) {
+                    map2odom.setIdentity();
+                } else {
+                    map2odom = trans_odom2map_.inverse();
+                }
+
+                others_positions.resize( others_odom_poses_.size() );
+                size_t i = 0;
+                for( const auto &odom_pose : others_odom_poses_ ) {
+                    others_positions[i].x() = odom_pose.second.second.position.x;
+                    others_positions[i].y() = odom_pose.second.second.position.y;
+                    others_positions[i].z() = odom_pose.second.second.position.z;
+                    i++;
+                }
+            }
+            pcl::PointCloud<PointT>::Ptr removed_cloud( new pcl::PointCloud<PointT>() );
+            if( !others_positions.empty() ) {
+                Eigen::Isometry3d map2sensor = odom.inverse() * map2odom;
+
+                // transform other robots' positions to sensor frame
+                std::vector<Eigen::Vector3f> others_positions_sensor;
+                others_positions_sensor.resize( others_positions.size() );
+                for( size_t i = 0; i < others_positions.size(); i++ ) {
+                    others_positions_sensor[i] = ( map2sensor * others_positions[i] ).cast<float>();
+                }
+
+                float robot_radius_sqr = get_parameter( "robot_remove_points_radius" ).as_double()
+                                         * get_parameter( "robot_remove_points_radius" ).as_double();
+
+                // get points to be removed
+                pcl::PointIndices::Ptr to_be_removed( new pcl::PointIndices() );
+                to_be_removed->indices.reserve( cloud->size() );
+                for( size_t i = 0; i < cloud->size(); i++ ) {
+                    const auto     &point_pcl = ( *cloud )[i];
+                    Eigen::Vector3f point( point_pcl.x, point_pcl.y, point_pcl.z );
+                    for( const auto &other_position_sensor : others_positions_sensor ) {
+                        float distSqr = ( point - other_position_sensor ).squaredNorm();
+                        if( distSqr < robot_radius_sqr ) {
+                            to_be_removed->indices.push_back( i );
+                            removed_cloud->push_back( cloud->at( i ) );
+                            break;
+                        }
+                    }
+                }
+
+                // remove points
+                pcl::ExtractIndices<PointT> extract;
+                extract.setInputCloud( cloud );
+                extract.setIndices( to_be_removed );
+                extract.setNegative( true );
+                extract.filter( *cloud );
+
+                // create ROS cloud to be stored within the keyframe
+                sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg_tmp( new sensor_msgs::msg::PointCloud2 );
+                pcl::toROSMsg( *cloud, *cloud_msg_tmp );
+                cloud_msg_filtered = cloud_msg_tmp;
+            }
+            if( other_robots_removed_points_pub_->get_subscription_count() > 0 ) {
+                sensor_msgs::msg::PointCloud2 removed_cloud_msg;
+                pcl::toROSMsg( *removed_cloud, removed_cloud_msg );
+                removed_cloud_msg.header.stamp    = cloud_msg->header.stamp;
+                removed_cloud_msg.header.frame_id = base_frame_id_;
+                other_robots_removed_points_pub_->publish( removed_cloud_msg );
+            }
+
+            // create keyframe and add it to the queue
+            graph_database_->add_odom_keyframe( stamp, odom, accum_d, cloud, cloud_msg_filtered );
+        }
+
+        // publish own odometry
+        mrg_slam_msgs::msg::PoseWithName pose_msg;
+        pose_msg.header     = odom_msg->header;
+        pose_msg.robot_name = own_name_;
+        pose_msg.pose       = odom_msg->pose.pose;
+        pose_msg.accum_dist = accum_d;
+        odom_broadcast_pub_->publish( pose_msg );
+    }
+
+    bool set_init_pose()
+    {
+        Eigen::Matrix4d pose_mat = Eigen::Matrix4d::Identity();
+        // try to initialize pose from init_odom or init_pose topic
+        if( get_parameter( "init_odom_topic" ).as_string() != "NONE" || get_parameter( "init_pose_topic" ).as_string() != "NONE" ) {
+            RCLCPP_INFO_STREAM( get_logger(), "Trying to initialize pose from odom topic: "
+                                                  << get_parameter( "init_odom_topic" ).as_string()
+                                                  << " or pose topic: " << get_parameter( "init_pose_topic" ).as_string() );
+            std::lock_guard<std::mutex> lock( init_pose_mutex_ );
+            if( init_pose_msg_ == nullptr ) {
+                RCLCPP_WARN_STREAM( get_logger(), "No initial pose received yet, waiting for it..." );
+                return false;
+            }
+            if( graph_database_->get_keyframe_queue().empty() ) {
+                RCLCPP_WARN_STREAM( get_logger(), "No keyframes in the queue, waiting for them..." );
+                return false;
+            }
+            Eigen::Isometry3d pose( Eigen::Isometry3d::Identity() );
+            tf2::fromMsg( init_pose_msg_->pose, pose );
+            pose = pose * graph_database_->get_keyframe_queue()[0]->odom.inverse();  // "remove" odom (which will be added later again)
+                                                                                     // such that the init pose actually corresponds to
+                                                                                     // the received pose
+            pose_mat = pose.matrix();
+        } else {  // use init_pose vector to initialize pose
+            RCLCPP_INFO_STREAM( get_logger(), "Initializing pose from init_pose vector" );
+            Eigen::Matrix<double, 6, 1> p( get_parameter( "init_pose" ).as_double_array().data() );
+            pose_mat.topLeftCorner<3, 3>() = ( Eigen::AngleAxisd( p[5], Eigen::Vector3d::UnitZ() )
+                                               * Eigen::AngleAxisd( p[4], Eigen::Vector3d::UnitY() )
+                                               * Eigen::AngleAxisd( p[3], Eigen::Vector3d::UnitX() ) )
+                                                 .toRotationMatrix();
+            pose_mat.topRightCorner<3, 1>() = p.head<3>();
+            // don't remove odom because we assume that the provided pose corresponds to the pose of the rover when starting the system
+        }
+        RCLCPP_INFO_STREAM( get_logger(), "initial pose:\n" << pose_mat );
+        trans_odom2map_mutex_.lock();
+        trans_odom2map_.matrix() = pose_mat;
+        trans_odom2map_mutex_.unlock();
+        return true;
+    }
+
+    void update_pose( const Eigen::Isometry3d &odom2map, std::pair<Eigen::Isometry3d, geometry_msgs::msg::Pose> &odom_pose )
+    {
+        auto             &odom_isometry = odom_pose.first;
+        auto             &odom_msg      = odom_pose.second;
+        Eigen::Isometry3d new_pose      = odom2map * odom_isometry;
+        odom_msg                        = tf2::toMsg( new_pose );
+    }
+
+    void publish_slam_pose( mrg_slam::KeyFrame::ConstPtr kf )
+    {
+        mrg_slam_msgs::msg::PoseWithName slam_pose_msg;
+        slam_pose_msg.header.stamp    = now();
+        slam_pose_msg.header.frame_id = map_frame_id_;
+        slam_pose_msg.pose            = isometry2pose( kf->node->estimate() );
+        slam_pose_msg.robot_name      = own_name_;
+        slam_pose_msg.accum_dist      = kf->accum_distance;
+        slam_pose_broadcast_pub_->publish( slam_pose_msg );
+    }
+
+    void slam_pose_broadcast_callback( mrg_slam_msgs::msg::PoseWithName::ConstSharedPtr slam_pose_msg )
+    {
+        std::unique_lock<std::mutex> unique_lck( main_thread_mutex_ );
+
+        const auto &prev_robot_keyframe = graph_database_->get_prev_robot_keyframe();
+        if( slam_pose_msg->robot_name == own_name_ || prev_robot_keyframe == nullptr ) {
+            return;
+        }
+
+        const auto &keyframes         = graph_database_->get_keyframes();
+        const auto &edges             = graph_database_->get_edges();
+        const auto &edge_ignore_uuids = graph_database_->get_edge_ignore_uuids();
+
+        // Eigen::Vector2d own_position          = prev_robot_keyframe->estimate().translation().head( 2 );
+        const auto &other_robot_name      = slam_pose_msg->robot_name;
+        double      other_accum_dist      = slam_pose_msg->accum_dist;
+        double     &other_last_accum_dist = others_last_accum_dist_[other_robot_name];
+        others_slam_poses_[other_robot_name].push_back( *slam_pose_msg );
+
+        if( other_last_accum_dist >= 0
+            && fabs( other_accum_dist - other_last_accum_dist ) < get_parameter( "graph_request_min_accum_dist" ).as_double() ) {
+            return;
+        }
+        if( others_last_graph_exchange_time_[other_robot_name] >= 0.0
+            && now().seconds() - others_last_graph_exchange_time_[other_robot_name]
+                   < get_parameter( "graph_request_min_time_delay" ).as_double() ) {
+            return;
+        }
+
+        bool   request_graph      = false;
+        double max_robot_dist_sqr = get_parameter( "graph_request_max_robot_dist" ).as_double()
+                                    * get_parameter( "graph_request_max_robot_dist" ).as_double();
+        if( get_parameter( "graph_exchange_mode" ).as_string() == "CURRENT_PROXIMITY" ) {
+            Eigen::Vector2d other_position = Eigen::Vector2d( slam_pose_msg->pose.position.x, slam_pose_msg->pose.position.y );
+            Eigen::Vector2d own_position   = prev_robot_keyframe->estimate().translation().head( 2 );
+            if( ( own_position - other_position ).squaredNorm() < max_robot_dist_sqr ) {
+                request_graph = true;
+            }
+        } else if( get_parameter( "graph_exchange_mode" ).as_string() == "PATH_PROXIMITY" ) {
+            for( const auto &keyframe : keyframes ) {
+                Eigen::Vector2d own_position = keyframe->estimate().translation().head( 2 );
+                for( const auto &other_pose : others_slam_poses_[other_robot_name] ) {
+                    Eigen::Vector2d other_position = Eigen::Vector2d( other_pose.pose.position.x, other_pose.pose.position.y );
+                    if( ( own_position - other_position ).squaredNorm() < max_robot_dist_sqr ) {
+                        request_graph = true;
+                        others_slam_poses_[other_robot_name].clear();
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        }
+        if( !request_graph ) {
+            return;
+        }
+
+        // Check if other_robot_name is registered in the SLAM experiment (param: multi_robot_names)
+        if( request_graph_service_clients_.find( other_robot_name ) == request_graph_service_clients_.end() ) {
+            RCLCPP_WARN_STREAM(
+                get_logger(),
+                "Trying to request graph from "
+                    << other_robot_name
+                    << " which is not registered as a request graph service client (param: multi_robot_names), returning..." );
+            return;
+        }
+
+        others_last_graph_exchange_time_[other_robot_name] = now().seconds();
+        while( !request_graph_service_clients_[other_robot_name]->wait_for_service( std::chrono::seconds( 2 ) ) ) {
+            if( !rclcpp::ok() ) {
+                return;
+            }
+            RCLCPP_WARN_STREAM_THROTTLE( get_logger(), *get_clock(), 1000,
+                                         "Waiting for service " << request_graph_service_clients_[other_robot_name]->get_service_name()
+                                                                << " to appear..." );
+        }
+
+        RCLCPP_INFO_STREAM( get_logger(), "Requesting graph from rover " << other_robot_name << " with new accum dist "
+                                                                         << other_accum_dist - other_last_accum_dist << "m" );
+        slam_status_msg_.in_graph_exchange = true;
+        slam_status_publisher_->publish( slam_status_msg_ );
+        mrg_slam_msgs::srv::PublishGraph::Request::SharedPtr req = std::make_shared<mrg_slam_msgs::srv::PublishGraph::Request>();
+
+        req->robot_name = own_name_;
+        req->processed_keyframe_uuid_strs.reserve( keyframes.size() );
+        for( const auto &keyframe : keyframes ) {
+            req->processed_keyframe_uuid_strs.push_back( keyframe->uuid_str );
+        }
+        req->processed_edge_uuid_strs.reserve( edges.size() + edge_ignore_uuids.size() );
+        for( const auto &edge : edges ) {
+            req->processed_edge_uuid_strs.push_back( edge->uuid_str );
+        }
+        // TODO check if this is correct
+        for( const auto &ignore_edge_uuid : edge_ignore_uuids ) {
+            req->processed_edge_uuid_strs.push_back( boost::uuids::to_string( ignore_edge_uuid ) );
+        }
+
+        // Unlock main_thread_mutex_
+        unique_lck.unlock();
+
+        auto               result_future = request_graph_service_clients_[other_robot_name]->async_send_request( req );
+        std::future_status status        = result_future.wait_for( std::chrono::seconds( 20 ) );
+
+        if( status == std::future_status::timeout ) {
+            RCLCPP_WARN_STREAM( get_logger(), "Request graph service call to rover " << other_robot_name << " timed out" );
+            slam_status_msg_.in_graph_exchange          = false;
+            slam_status_msg_.last_exchange_keyframes    = 0;
+            slam_status_msg_.last_exchange_edges        = 0;
+            slam_status_msg_.last_exchange_bytes        = 0;
+            slam_status_msg_.total_received_bytes       = total_received_bytes_;
+            slam_status_publisher_->publish( slam_status_msg_ );
+            return;
+        }
+        if( status == std::future_status::ready ) {
+            RCLCPP_INFO_STREAM( get_logger(), "Request graph service call to rover " << other_robot_name << " successful" );
+        }
+        auto result = result_future.get();
+        // collect some statistics
+        int graph_bytes = 0;
+        for( const auto &keyframe : result->graph.keyframes ) {
+            graph_bytes += keyframe.cloud.data.size();
+            graph_bytes += 7 * sizeof( double );
+        }
+        graph_bytes += result->graph.edges.size() * sizeof( mrg_slam_msgs::msg::EdgeRos );
+        received_graph_bytes_.push_back( graph_bytes );
+        total_received_bytes_ += graph_bytes;
+        // Populate graph exchange stats before moving the graph
+        slam_status_msg_.last_exchange_keyframes = static_cast<int32_t>( result->graph.keyframes.size() );
+        slam_status_msg_.last_exchange_edges     = static_cast<int32_t>( result->graph.edges.size() );
+        slam_status_msg_.last_exchange_bytes     = graph_bytes;
+        slam_status_msg_.total_received_bytes    = total_received_bytes_;
+        // Fill the graph queue with the received graph
+        graph_database_->add_graph_ros( std::move( result->graph ) );
+        slam_status_msg_.in_graph_exchange = false;
+        slam_status_publisher_->publish( slam_status_msg_ );
+        other_last_accum_dist = other_accum_dist;
+    }
+
+    /**
+     * @brief received odom msgs from other robots proccessed
+     * @param graph_msg
+     */
+    void odom_broadcast_callback( mrg_slam_msgs::msg::PoseWithName::ConstSharedPtr pose_msg )
+    {
+        if( pose_msg->robot_name == own_name_ ) {
+            return;
+        }
+
+        mrg_slam_msgs::msg::PoseWithNameArray pose_array_msg;
+        pose_array_msg.header.stamp    = pose_msg->header.stamp;
+        pose_array_msg.header.frame_id = map_frame_id_;
+
+        std::string other_name = pose_msg->robot_name;
+        // update poses of other robots in own map frame
+        {
+            std::lock_guard<std::mutex> lock( trans_odom2map_mutex_ );
+            const auto                  iter = others_odom2map_.find( other_name );
+            if( iter != others_odom2map_.end() ) {
+                auto &odom_pose = others_odom_poses_[other_name];
+                tf2::fromMsg( pose_msg->pose, odom_pose.first );
+                update_pose( iter->second, odom_pose );
+                pose_array_msg.poses.resize( others_odom_poses_.size() );
+                size_t i = 0;
+                for( const auto &odom_pair : others_odom_poses_ ) {
+                    pose_array_msg.poses[i].header     = pose_array_msg.header;
+                    pose_array_msg.poses[i].robot_name = odom_pair.first;
+                    pose_array_msg.poses[i].pose       = odom_pair.second.second;
+                    i++;
+                }
+            }
+        }
+
+        // publish this information
+        if( !pose_array_msg.poses.empty() ) {
+            others_poses_pub_->publish( pose_array_msg );
+        }
+    }
+
+
+    /**
+     * @brief receive first node pose from odometry topic
+     */
+    void init_odom_callback( nav_msgs::msg::Odometry::ConstSharedPtr msg )
+    {
+        auto pose_stamped    = std::make_shared<geometry_msgs::msg::PoseStamped>();
+        pose_stamped->header = msg->header;
+        pose_stamped->pose   = msg->pose.pose;
+        std::lock_guard<std::mutex> lock( init_pose_mutex_ );
+        init_pose_msg_ = pose_stamped;
+    }
+
+    /**
+     * @brief receive first node pose from pose topic
+     */
+    void init_pose_callback( geometry_msgs::msg::PoseStamped::ConstSharedPtr msg )
+    {
+        std::lock_guard<std::mutex> lock( init_pose_mutex_ );
+        init_pose_msg_ = msg;
+    }
+
+
+    /**
+     * @brief update the map_cloud_msg_ with the latest map
+     * @return true if map_cloud_msg_ was updated (map_cloud_msg_ can still be valid even if not updated)
+     */
+    bool update_map_cloud_msg()
+    {
+        if( !map_cloud_msg_update_required_ ) {
+            return false;
+        }
+
+        std::vector<KeyFrameSnapshot::Ptr> snapshot;
+
+        {
+            std::lock_guard<std::mutex> lock( snapshots_mutex_ );
+
+            snapshot                       = keyframes_snapshot_;
+            map_cloud_msg_update_required_ = false;
+        }
+
+        auto cloud = map_cloud_generator_->generate( snapshot, get_parameter( "map_cloud_resolution" ).as_double(),
+                                                     get_parameter( "map_cloud_min_points_per_voxel" ).as_int(),
+                                                     get_parameter( "map_cloud_distance_far_thresh" ).as_double(), false );
+        if( !cloud ) {
+            return false;
+        }
+
+        cloud->header.frame_id = map_frame_id_;
+        cloud->header.stamp    = snapshot.back()->cloud->header.stamp;
+
+        pcl::toROSMsg( *cloud, *map_cloud_msg_ );
+
+        return true;
+    }
+
+    /**
+     * @brief generate map point cloud and publish it
+     * @param event
+     */
+    void map_points_publish_timer_callback()
+    {
+        if( !map_points_timer_pub_->get_subscription_count() ) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock( map_cloud_msg_mutex_ );
+
+        if( !update_map_cloud_msg() ) {
+            return;
+        }
+
+        map_points_timer_pub_->publish( *map_cloud_msg_ );
+    }
+
+    /**
+     * @brief Publish the map points triggered by a service call and not by a timer. On a different topic than the timer
+     */
+    void publish_map_service( mrg_slam_msgs::srv::PublishMap::Request::ConstSharedPtr req,
+                              mrg_slam_msgs::srv::PublishMap::Response::SharedPtr     res )
+    {
+        std::vector<KeyFrameSnapshot::Ptr> snapshot;
+        {
+            std::lock_guard<std::mutex> lock( snapshots_mutex_ );
+            snapshot = keyframes_snapshot_;
+        }
+
+        // Use config values if not set in request
+        float       resolution           = req->resolution == 0 ? get_parameter( "map_cloud_resolution" ).as_double() : req->resolution;
+        int         min_points_per_voxel = req->min_points_per_voxel < 0 ? get_parameter( "map_cloud_min_points_per_voxel" ).as_int()
+                                                                         : req->min_points_per_voxel;
+        float       distance_far_thresh  = req->distance_far_thresh == 0 ? get_parameter( "map_cloud_distance_far_thresh" ).as_double()
+                                                                         : req->distance_far_thresh;
+        std::string frame_id             = req->frame_id.empty() ? map_frame_id_ : req->frame_id;
+
+        auto cloud = map_cloud_generator_->generate( snapshot, resolution, min_points_per_voxel, distance_far_thresh,
+                                                     req->skip_first_cloud );
+        if( !cloud ) {
+            RCLCPP_WARN_STREAM( get_logger(), "Failed to generate map cloud" );
+            res->success = false;
+            return;
+        }
+        cloud->header.frame_id = frame_id;
+        cloud->header.stamp    = snapshot.back()->cloud->header.stamp;
+
+        auto cloud_msg = sensor_msgs::msg::PointCloud2::SharedPtr( new sensor_msgs::msg::PointCloud2() );
+        pcl::toROSMsg( *cloud, *cloud_msg );
+
+        map_points_service_pub_->publish( *cloud_msg );
+        res->success = true;
+    }
+
+    /**
+     * @brief this methods adds all the data in the queues to the pose graph, and then optimizes the pose graph
+     * @param event
+     */
+    void optimization_timer_callback()
+    {
+        std::lock_guard<std::mutex> lock( main_thread_mutex_ );
+        // Cancel the timer and reset it whenever this function returns, to avoid overlapping callbacks in case of long optimizations,
+        // since we use a reentrant callback group for this timer
+        optimization_timer_->cancel();
+
+        if( graph_database_->empty() ) {
+            if( !set_init_pose() ) {
+                optimization_timer_->reset();
+                return;
+            }
+        }
+
+        // add keyframes and floor coeffs in the queues to the pose graph, TODO update trans_odom2map_?
+        bool keyframe_updated = graph_database_->flush_keyframe_queue( trans_odom2map_ );
+
+        if( !keyframe_updated & !graph_database_->flush_static_keyframe_queue()
+            & !graph_database_->flush_graph_queue( others_prev_robot_keyframes_, loop_detector_->get_loop_manager() )
+            & !graph_database_->flush_loaded_graph( loop_detector_->get_loop_manager() )
+            & !floor_coeffs_processor_.flush( graph_database_, graph_slam_ )
+            & !gps_processor_.flush( graph_slam_, graph_database_->get_keyframes() )
+            & !imu_processor_.flush( graph_slam_, graph_database_->get_keyframes(), base_frame_id_ ) ) {
+            if( graph_database_->get_prev_robot_keyframe() != nullptr ) {
+                publish_slam_pose( graph_database_->get_prev_robot_keyframe() );
+            }
+            optimization_timer_->reset();
+            return;
+        }
+
+        // Measure loop closure time
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // loop detection
+        slam_status_msg_.in_loop_closure = true;
+        slam_status_publisher_->publish( slam_status_msg_ );
+        std::vector<Loop::Ptr> loops = loop_detector_->detect( graph_database_ );
+        graph_database_->insert_loops( loops );
+
+
+        auto end = std::chrono::high_resolution_clock::now();
+        loop_closure_times_.push_back( std::chrono::duration_cast<std::chrono::microseconds>( end - start ).count() );
+
+        const auto &keyframes           = graph_database_->get_keyframes();
+        const auto &edges               = graph_database_->get_edges();
+        const auto &prev_robot_keyframe = graph_database_->get_prev_robot_keyframe();
+
+        if( keyframes.empty() ) {
+            optimization_timer_->reset();
+            return;
+        }
+
+        // optimize the pose graph
+        slam_status_msg_.in_loop_closure = false;
+        slam_status_msg_.in_optimization = true;
+        slam_status_publisher_->publish( slam_status_msg_ );
+        start = std::chrono::high_resolution_clock::now();
+        graph_slam_->optimize( get_parameter( "g2o_solver_num_iterations" ).as_int(), get_parameter( "g2o_verbose" ).as_bool() );
+        end = std::chrono::high_resolution_clock::now();
+        graph_optimization_times_.push_back( std::chrono::duration_cast<std::chrono::microseconds>( end - start ).count() );
+
+        // get transformations between map and robots
+        Eigen::Isometry3d               trans = prev_robot_keyframe->node->estimate() * prev_robot_keyframe->odom.inverse();
+        std::vector<KeyFrame::ConstPtr> others_last_kf;
+        trans_odom2map_mutex_.lock();
+        trans_odom2map_ = trans;
+        others_last_kf.reserve( others_prev_robot_keyframes_.size() );
+        for( const auto &other_prev_kf : others_prev_robot_keyframes_ ) {
+            Eigen::Isometry3d other_trans         = other_prev_kf.second.first->node->estimate() * other_prev_kf.second.second.inverse();
+            others_odom2map_[other_prev_kf.first] = other_trans;
+
+            auto iter = others_odom_poses_.find( other_prev_kf.first );
+
+            if( iter != others_odom_poses_.end() ) {
+                update_pose( other_trans, iter->second );
+                others_last_kf.emplace_back( other_prev_kf.second.first );
+            }
+        }
+        trans_odom2map_mutex_.unlock();
+
+        auto marginals = graph_slam_->compute_marginals();
+
+        std::vector<KeyFrameSnapshot::Ptr> keyframes_snapshot_tmp( keyframes.size() );
+        std::transform( keyframes.begin(), keyframes.end(), keyframes_snapshot_tmp.begin(),
+                        [=]( const KeyFrame::Ptr &k ) { return std::make_shared<KeyFrameSnapshot>( k, marginals ); } );
+
+        snapshots_mutex_.lock();
+        keyframes_snapshot_.swap( keyframes_snapshot_tmp );
+        map_cloud_msg_update_required_ = true;
+        snapshots_mutex_.unlock();
+
+        // Publish the current optimized slam pose
+        publish_slam_pose( prev_robot_keyframe );
+
+        graph_database_->save_keyframe_poses();
+
+        if( odom2map_pub_->get_subscription_count() ) {
+            geometry_msgs::msg::TransformStamped ts = matrix2transform( prev_robot_keyframe->stamp, trans.matrix().cast<float>(),
+                                                                        map_frame_id_, odom_frame_id_ );
+            odom2map_pub_->publish( ts );
+        }
+
+        if( markers_pub.getNumSubscribers() ) {
+            markers_pub.publish( graph_slam_, graph_database_->get_slam_uuid(), keyframes, edges, prev_robot_keyframe, others_last_kf );
+        }
+        if( markers_pub.getNumMarginalsSubscribers() ) {
+            markers_pub.publishMarginals( graph_database_->get_slam_uuid(), keyframes, marginals );
+        }
+
+        slam_status_msg_.in_optimization = false;
+        slam_status_publisher_->publish( slam_status_msg_ );
+        optimization_timer_->reset();
+    }
+
+
+    void add_static_keyframes_service( mrg_slam_msgs::srv::AddStaticKeyFrames::Request::ConstSharedPtr req,
+                                       mrg_slam_msgs::srv::AddStaticKeyFrames::Response::SharedPtr     res )
+    {
+        graph_database_->add_static_keyframes( req->keyframes );
+        res->success = true;
+    }
+
+    /**
+     * @brief save all graph information and some timing information to request's directory
+     * @param req request containing the directory to save the graph information to
+     * @param res success boolean
+     * @return
+     */
+    void save_graph_service( mrg_slam_msgs::srv::SaveGraph::Request::ConstSharedPtr req,
+                             mrg_slam_msgs::srv::SaveGraph::Response::SharedPtr     res )
+    {
+        std::lock_guard<std::mutex> lock( main_thread_mutex_ );
+
+        std::string directory = req->directory;
+        if( directory.back() == '/' ) {
+            directory.pop_back();
+        }
+
+        std::cout << "Saving graph information to: " << directory << std::endl;
+
+        std::string keyframe_directory = directory + "/keyframes";
+        if( !boost::filesystem::is_directory( keyframe_directory ) ) {
+            boost::filesystem::create_directories( keyframe_directory );
+        }
+
+        // TODO move saving of keyframes, edges, and timing information to graph to GraphDatabase
+
+        const auto &keyframes = graph_database_->get_keyframes();
+        const auto &edges     = graph_database_->get_edges();
+
+        // Saving detailed keyframe and edge info
+        for( int i = 0; i < (int)keyframes.size(); i++ ) {
+            std::stringstream ss;
+            ss << boost::format( "%s/%06d" ) % keyframe_directory % i;
+            keyframes[i]->save( ss.str() );
+        }
+
+        std::string edge_directory = directory + "/edges";
+        if( !boost::filesystem::is_directory( edge_directory ) ) {
+            boost::filesystem::create_directories( edge_directory );
+        }
+        for( int i = 0; i < (int)edges.size(); i++ ) {
+            std::stringstream ss;
+            ss << boost::format( "%s/%06d" ) % edge_directory % i;
+            edges[i]->save( ss.str() );
+        }
+
+        // Saving g2o files
+        std::string g2o_directory = directory + "/g2o";
+        if( !boost::filesystem::is_directory( g2o_directory ) ) {
+            boost::filesystem::create_directories( g2o_directory );
+        }
+
+        graph_slam_->save( g2o_directory + "/graph.g2o" );
+        std::ofstream ofs( g2o_directory + "/special_nodes.csv" );
+        const auto   &floor_plane_node = floor_coeffs_processor_.floor_plane_node();
+        const auto   &anchor_node      = graph_database_->get_anchor_node();
+        const auto   &anchor_edge_g2o  = graph_database_->get_anchor_edge_g2o();
+        ofs << "anchor_node " << ( anchor_node == nullptr ? -1 : anchor_node->id() ) << std::endl;
+        ofs << "anchor_edge " << ( anchor_edge_g2o == nullptr ? -1 : anchor_edge_g2o->id() ) << std::endl;
+        ofs << "floor_node " << ( floor_plane_node == nullptr ? -1 : floor_plane_node->id() ) << std::endl;
+
+        // Saving gps data
+        const auto &zero_utm = gps_processor_.zero_utm();
+        if( zero_utm ) {
+            std::ofstream zero_utm_ofs( directory + "/zero_utm" );
+            zero_utm_ofs << boost::format( "%.6f %.6f %.6f" ) % zero_utm->x() % zero_utm->y() % zero_utm->z() << std::endl;
+        }
+        const auto &enu_origin = gps_processor_.enu_origin();
+        const auto &zero_enu   = gps_processor_.zero_enu();
+        if( enu_origin && zero_enu ) {
+            std::ofstream enu_origin_ofs( directory + "/enu_origin" );
+            enu_origin_ofs << boost::format( "%.8f %.8f %.3f" ) % enu_origin->latitude % enu_origin->longitude % enu_origin->altitude
+                           << std::endl;
+            enu_origin_ofs << boost::format( "%.8f %.8f %.3f" ) % zero_enu->x() % zero_enu->y() % zero_enu->z() << std::endl;
+        }
+
+        // Write some network statistics
+        std::ofstream network_stats_ofs( directory + "/network_stats.txt" );
+        network_stats_ofs << "received_graph_bytes";
+        for( const auto &bytes : received_graph_bytes_ ) {
+            network_stats_ofs << " " << bytes;
+        }
+        network_stats_ofs << std::endl;
+        network_stats_ofs << "total_received_bytes " << std::accumulate( received_graph_bytes_.begin(), received_graph_bytes_.end(), 0 )
+                          << std::endl;
+        network_stats_ofs << "sent_graph_bytes";
+        for( const auto &bytes : sent_graph_bytes_ ) {
+            network_stats_ofs << " " << bytes;
+        }
+        network_stats_ofs << std::endl;
+        network_stats_ofs << "total_sent_bytes " << std::accumulate( sent_graph_bytes_.begin(), sent_graph_bytes_.end(), 0 ) << std::endl;
+
+        // Write some timing statistics
+        std::ofstream timing_stats_ofs( directory + "/timing_stats.txt" );
+        timing_stats_ofs << "loop_closure_times_us";
+        for( const auto &time : loop_closure_times_ ) {
+            timing_stats_ofs << " " << time;
+        }
+        timing_stats_ofs << std::endl;
+        timing_stats_ofs << "total_loop_closure_time_us " << std::accumulate( loop_closure_times_.begin(), loop_closure_times_.end(), 0 )
+                         << std::endl;
+        timing_stats_ofs << "loop_closure_candidates";
+        for( const auto &candidates : loop_detector_->loop_candidates_sizes ) {
+            timing_stats_ofs << " " << candidates;
+        }
+        timing_stats_ofs << std::endl;
+        int total_candidates = std::accumulate( loop_detector_->loop_candidates_sizes.begin(), loop_detector_->loop_candidates_sizes.end(),
+                                                0 );
+        timing_stats_ofs << "total_loop_closure_candidates " << total_candidates << std::endl;
+        if( loop_detector_->loop_candidates_sizes.size() > 0 && total_candidates > 0 ) {
+            timing_stats_ofs << "average_candidates " << total_candidates / loop_detector_->loop_candidates_sizes.size() << std::endl;
+            double total_loop_detector_times = std::accumulate( loop_detector_->loop_detection_times.begin(),
+                                                                loop_detector_->loop_detection_times.end(), 0 );
+            timing_stats_ofs << "average_time_per_candidate_us " << total_loop_detector_times / total_candidates << std::endl;
+        }
+
+        timing_stats_ofs << "graph_optimization_times_us";
+        for( const auto &time : graph_optimization_times_ ) {
+            timing_stats_ofs << " " << time;
+        }
+        timing_stats_ofs << std::endl;
+        timing_stats_ofs << "total_graph_optimization_time_us "
+                         << std::accumulate( graph_optimization_times_.begin(), graph_optimization_times_.end(), 0 ) << std::endl;
+
+        res->success = true;
+    }
+
+    /**
+     * @brief load graph data from a directory that was previously saved with the save_graph service
+     * @param req
+     * @param res
+     * @return
+     */
+    void load_graph_service( mrg_slam_msgs::srv::LoadGraph::Request::ConstSharedPtr req,
+                             mrg_slam_msgs::srv::LoadGraph::Response::SharedPtr     res )
+    {
+        std::lock_guard<std::mutex> lock( main_thread_mutex_ );
+
+        // check if the directory exists
+        if( !boost::filesystem::is_directory( req->directory ) ) {
+            RCLCPP_WARN_STREAM( rclcpp::get_logger( "load_graph_service" ),
+                                "Directory " << req->directory << " does not exist, cannot load graph" );
+            res->success = false;
+            return;
+        }
+
+        res->success = graph_database_->load_graph( req->directory );
+    }
+
+    /**
+     * @brief save map data as pcd
+     * @param req
+     * @param res
+     * @return
+     */
+    void save_map_service( mrg_slam_msgs::srv::SaveMap::Request::ConstSharedPtr req, mrg_slam_msgs::srv::SaveMap::Response::SharedPtr res )
+    {
+        std::vector<KeyFrameSnapshot::Ptr> snapshot;
+        {
+            std::lock_guard<std::mutex> lock( snapshots_mutex_ );
+            snapshot = keyframes_snapshot_;
+        }
+
+        // Use config values if not set in request
+        float       resolution           = req->resolution == 0 ? get_parameter( "map_cloud_resolution" ).as_double() : req->resolution;
+        int         min_points_per_voxel = req->min_points_per_voxel < 0 ? get_parameter( "map_cloud_min_points_per_voxel" ).as_int()
+                                                                         : req->min_points_per_voxel;
+        float       distance_far_thresh  = req->distance_far_thresh == 0 ? get_parameter( "map_cloud_distance_far_thresh" ).as_double()
+                                                                         : req->distance_far_thresh;
+        std::string frame_id             = req->frame_id.empty() ? map_frame_id_ : req->frame_id;
+
+        RCLCPP_INFO_STREAM( get_logger(), "Trying to save map to " << req->file_path << " with resolution " << resolution
+                                                                   << " and min_points_per_voxel " << min_points_per_voxel );
+
+        auto cloud = map_cloud_generator_->generate( snapshot, resolution, min_points_per_voxel, distance_far_thresh,
+                                                     req->skip_first_cloud );
+        if( !cloud ) {
+            res->success = false;
+            return;
+        }
+
+        const auto &zero_utm = gps_processor_.zero_utm();
+        if( zero_utm && req->utm ) {
+            for( auto &pt : cloud->points ) {
+                pt.getVector3fMap() += ( *zero_utm ).cast<float>();
+            }
+        }
+
+        const auto &zero_enu = gps_processor_.zero_enu();
+        if( zero_enu ) {
+            for( auto &pt : cloud->points ) {
+                pt.getVector3fMap() += ( *zero_enu ).cast<float>();
+            }
+        }
+
+        cloud->header.frame_id = map_frame_id_;
+        cloud->header.stamp    = snapshot.back()->cloud->header.stamp;
+
+        if( zero_utm ) {
+            std::ofstream ofs( req->file_path + ".utm" );
+            ofs << boost::format( "%.6f %.6f %.6f" ) % zero_utm->x() % zero_utm->y() % zero_utm->z() << std::endl;
+        }
+
+        const auto &enu_origin = gps_processor_.enu_origin();
+        if( enu_origin && zero_enu ) {
+            std::ofstream ofs( req->file_path + ".enu" );
+            ofs << boost::format( "%.8f %.8f %.3f" ) % enu_origin->latitude % enu_origin->longitude % enu_origin->altitude << std::endl;
+        }
+
+        auto dir = boost::filesystem::path( req->file_path ).remove_filename();
+        if( !boost::filesystem::is_directory( dir ) ) {
+            boost::filesystem::create_directories( dir );
+        }
+        int ret      = pcl::io::savePCDFileBinary( req->file_path, *cloud );
+        res->success = ( ret == 0 );
+
+        if( res->success ) {
+            RCLCPP_INFO_STREAM( get_logger(), "Saved map " << req->file_path << " with " << cloud->points.size() << " points" );
+        } else {
+            RCLCPP_ERROR_STREAM( get_logger(), "Failed to save " << req->file_path << " with " << cloud->points.size() << " points" );
+        }
+    }
+
+
+    /**
+     * @brief publish graph data to other robots, skipping keyframes and edges that have already been processed
+     * @param req
+     * @param res
+     * @return
+     */
+    void publish_graph_service( mrg_slam_msgs::srv::PublishGraph::Request::ConstSharedPtr req,
+                                mrg_slam_msgs::srv::PublishGraph::Response::SharedPtr     res )
+    {
+        {
+            std::lock_guard<std::mutex> lock( main_thread_mutex_ );
+
+            const auto &keyframes           = graph_database_->get_keyframes();
+            const auto &edges               = graph_database_->get_edges();
+            const auto &prev_robot_keyframe = graph_database_->get_prev_robot_keyframe();
+
+            if( keyframes.empty() ) {
+                return;
+            }
+
+            RCLCPP_INFO_STREAM( get_logger(), "Received publish graph request from "
+                                                  << req->robot_name << " with " << req->processed_keyframe_uuid_strs.size()
+                                                  << " processed keyframes and " << req->processed_edge_uuid_strs.size()
+                                                  << " processed edges." );
+
+            res->graph.robot_name               = own_name_;
+            res->graph.latest_keyframe_uuid_str = prev_robot_keyframe->uuid_str;
+            res->graph.latest_keyframe_odom     = tf2::toMsg( prev_robot_keyframe->odom );
+
+            res->graph.keyframes.reserve( keyframes.size() );
+
+            // Collect indices and total cloud bytes for unprocessed keyframes
+            std::vector<size_t> unprocessed_indices;
+            uint64_t total_cloud_bytes = 0;
+            for( size_t i = 0; i < keyframes.size(); i++ ) {
+                auto &src = keyframes[i];
+                auto it_processed_uuids = std::find( req->processed_keyframe_uuid_strs.begin(), req->processed_keyframe_uuid_strs.end(),
+                                                     src->uuid_str );
+                if( it_processed_uuids != req->processed_keyframe_uuid_strs.end() ) {
+                    RCLCPP_DEBUG_STREAM( get_logger(), src->readable_id << " skipped, already processed" );
+                    continue;
+                }
+                unprocessed_indices.push_back( i );
+                total_cloud_bytes += src->cloud_msg->data.size();
+            }
+
+            // Select tier: batch policy picks one tier for all clouds,
+            // per_cloud policy defers to per-cloud budgeting inside apply_tier/downsample_for_transmission
+            const bool use_batch = cloud_transmitter_->policy() == AdaptiveCloudTransmitter::Policy::BATCH;
+            AdaptiveCloudTransmitter::Tier batch_tier = AdaptiveCloudTransmitter::Tier::EXCELLENT;
+            if( use_batch ) {
+                batch_tier = cloud_transmitter_->select_batch_tier( total_cloud_bytes );
+                RCLCPP_INFO_STREAM( get_logger(), "Batch policy: " << unprocessed_indices.size() << " clouds, "
+                                    << total_cloud_bytes << " B total -> tier: " << cloud_transmitter_->tier_name( batch_tier ) );
+            }
+
+            int added_keyframes = 0;
+            for( size_t idx : unprocessed_indices ) {
+                auto &src = keyframes[idx];
+                RCLCPP_DEBUG_STREAM( get_logger(), src->readable_id << " publishing" );
+
+                mrg_slam_msgs::msg::KeyFrameRos dst;
+                dst.robot_name      = src->robot_name;
+                dst.uuid_str        = src->uuid_str;
+                dst.slam_uuid_str   = src->slam_uuid_str;
+                dst.stamp           = src->stamp;
+                dst.odom_counter    = src->odom_keyframe_counter;
+                dst.first_keyframe  = src->first_keyframe;
+                dst.static_keyframe = src->static_keyframe;
+                dst.accum_distance  = src->accum_distance;
+                dst.estimate        = tf2::toMsg( src->estimate() );
+                dst.cloud           = use_batch
+                    ? cloud_transmitter_->apply_tier( *src->cloud_msg, batch_tier )
+                    : cloud_transmitter_->downsample_for_transmission( *src->cloud_msg );
+                res->graph.keyframes.push_back( std::move( dst ) );
+                added_keyframes++;
+            }
+            res->graph.keyframes.resize( added_keyframes );
+
+            res->graph.edges.reserve( edges.size() );
+            int added_edges = 0;
+            for( size_t i = 0; i < edges.size(); i++ ) {
+                auto &src = edges[i];
+                // Skip adding edges that have already been processed by the other robot
+                auto it_processed_uuids = std::find( req->processed_edge_uuid_strs.begin(), req->processed_edge_uuid_strs.end(),
+                                                     src->uuid_str );
+                if( it_processed_uuids != req->processed_edge_uuid_strs.end() ) {
+                    RCLCPP_DEBUG_STREAM( get_logger(), src->readable_id << " skipped, already processed" );
+                    continue;
+                } else {
+                    RCLCPP_DEBUG_STREAM( get_logger(), src->readable_id << " publishing" );
+                }
+
+                mrg_slam_msgs::msg::EdgeRos dst;
+                dst.type          = static_cast<uint8_t>( src->type );
+                dst.uuid_str      = src->uuid_str;
+                dst.from_uuid_str = src->from_uuid_str;
+                dst.to_uuid_str   = src->to_uuid_str;
+                dst.relative_pose = tf2::toMsg( src->relative_pose() );
+                Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> information_map( dst.information.data() );
+                information_map = src->information();
+                res->graph.edges.push_back( std::move( dst ) );
+                added_edges++;
+            }
+            res->graph.edges.resize( added_edges );
+
+            // Collect some network statistics
+            int graph_bytes = 0;
+            for( const auto &keyframe : res->graph.keyframes ) {
+                graph_bytes += keyframe.cloud.data.size();
+                graph_bytes += 7 * 8;  // 7 doubles for the pose
+            }
+            graph_bytes += res->graph.edges.size() * sizeof( mrg_slam_msgs::msg::EdgeRos );
+            sent_graph_bytes_.push_back( graph_bytes );
+
+
+            RCLCPP_INFO_STREAM( get_logger(), "Published graph with " << added_keyframes << " keyframes and " << added_edges << " edges" );
+        }
+    }
+
+
+    void request_graph_service( mrg_slam_msgs::srv::RequestGraphs::Request::ConstSharedPtr req,
+                                mrg_slam_msgs::srv::RequestGraphs::Response::SharedPtr     res )
+    {
+        std::unique_lock<std::mutex> unique_lck( main_thread_mutex_ );
+
+        const auto &keyframes = graph_database_->get_keyframes();
+        const auto &edges     = graph_database_->get_edges();
+
+        mrg_slam_msgs::srv::PublishGraph::Request::SharedPtr pub_req = std::make_shared<mrg_slam_msgs::srv::PublishGraph::Request>();
+
+        pub_req->robot_name = own_name_;
+        pub_req->processed_keyframe_uuid_strs.reserve( keyframes.size() );
+        for( const auto &keyframe : keyframes ) {
+            pub_req->processed_keyframe_uuid_strs.push_back( keyframe->uuid_str );
+        }
+        pub_req->processed_edge_uuid_strs.reserve( edges.size() );
+        for( const auto &edge : edges ) {
+            pub_req->processed_edge_uuid_strs.push_back( edge->uuid_str );
+        }
+
+        unique_lck.unlock();
+
+        for( const auto &robot_name : req->robot_names ) {
+            if( robot_name == own_name_ ) {
+                continue;
+            }
+            if( request_graph_service_clients_.find( robot_name ) == request_graph_service_clients_.end() ) {
+                RCLCPP_WARN_STREAM( get_logger(), "Skipping request graph from "
+                                                      << robot_name << " which is not registered as a request graph service client" );
+                continue;
+            }
+            while( !request_graph_service_clients_[robot_name]->wait_for_service( std::chrono::seconds( 2 ) ) ) {
+                if( !rclcpp::ok() ) {
+                    return;
+                }
+                RCLCPP_WARN_STREAM_THROTTLE( get_logger(), *get_clock(), 1000,
+                                             "Waiting for service " << request_graph_service_clients_[robot_name]->get_service_name()
+                                                                    << " to appear..." );
+            }
+
+            auto               result_future = request_graph_service_clients_[robot_name]->async_send_request( pub_req );
+            std::future_status status        = result_future.wait_for( std::chrono::seconds( 10 ) );
+            if( status == std::future_status::timeout ) {
+                RCLCPP_ERROR_STREAM( get_logger(), "Request graph service call to rover " << robot_name << " timed out" );
+                return;
+            }
+            if( status == std::future_status::ready ) {
+                RCLCPP_INFO_STREAM( get_logger(), "Request graph service call to rover " << robot_name << " successful" );
+            }
+            auto result = result_future.get();
+
+            // Collect stats BEFORE moving the graph (accessing moved-from data is undefined)
+            int num_keyframes    = static_cast<int>( result->graph.keyframes.size() );
+            int num_edges        = static_cast<int>( result->graph.edges.size() );
+            int graph_size_bytes = 0;
+            for( const auto &keyframe : result->graph.keyframes ) {
+                graph_size_bytes += keyframe.cloud.data.size();
+                graph_size_bytes += 7 * 8;  // 7 doubles for the pose
+            }
+            graph_size_bytes += result->graph.edges.size() * sizeof( mrg_slam_msgs::msg::EdgeRos );
+            received_graph_bytes_.push_back( graph_size_bytes );
+            total_received_bytes_ += graph_size_bytes;
+
+            // Fill the graph queue with the received graph
+            graph_database_->add_graph_ros( std::move( result->graph ) );
+
+            others_last_accum_dist_[robot_name] = others_slam_poses_[robot_name].back().accum_dist;
+
+            // Publish graph exchange stats
+            slam_status_msg_.last_exchange_keyframes = num_keyframes;
+            slam_status_msg_.last_exchange_edges     = num_edges;
+            slam_status_msg_.last_exchange_bytes     = graph_size_bytes;
+            slam_status_msg_.total_received_bytes    = total_received_bytes_;
+            slam_status_publisher_->publish( slam_status_msg_ );
+        }
+        // Call the optimization callback to process the received graphs needed when working with use_sim_time true
+        optimization_timer_callback();
+    }
+
+    void get_graph_uuids_service( mrg_slam_msgs::srv::GetGraphUuids::Request::ConstSharedPtr req,
+                                  mrg_slam_msgs::srv::GetGraphUuids::Response::SharedPtr     res )
+    {
+        std::lock_guard<std::mutex> lock( main_thread_mutex_ );
+
+        const auto &keyframes = graph_database_->get_keyframes();
+        const auto &edges     = graph_database_->get_edges();
+
+        res->keyframe_uuid_strs.reserve( keyframes.size() );
+        res->readable_keyframes.reserve( keyframes.size() );
+        for( size_t i = 0; i < keyframes.size(); i++ ) {
+            res->keyframe_uuid_strs.push_back( keyframes[i]->uuid_str );
+            res->readable_keyframes.push_back( keyframes[i]->readable_id );
+        }
+
+        res->edge_uuid_strs.reserve( edges.size() );
+        res->readable_edges.reserve( edges.size() );
+        for( size_t i = 0; i < edges.size(); i++ ) {
+            res->edge_uuid_strs.push_back( edges[i]->uuid_str );
+            res->readable_edges.push_back( edges[i]->readable_id );
+        }
+    }
+
+private:
+    // timers
+    rclcpp::TimerBase::SharedPtr one_shot_initalization_timer_;
+    rclcpp::TimerBase::SharedPtr optimization_timer_;
+    rclcpp::TimerBase::SharedPtr map_publish_timer_;
+
+    // Odometry and pointCloud synchronization for SLAM keyframe generation
+    message_filters::Subscriber<nav_msgs::msg::Odometry>             odom_sub_;
+    message_filters::Subscriber<sensor_msgs::msg::PointCloud2>       cloud_sub_;
+    std::unique_ptr<message_filters::Synchronizer<ApproxSyncPolicy>> sync_;
+
+    rclcpp::Publisher<mrg_slam_msgs::msg::PoseWithName>::SharedPtr                               slam_pose_broadcast_pub_;
+    std::unordered_map<std::string, rclcpp::Client<mrg_slam_msgs::srv::PublishGraph>::SharedPtr> request_graph_service_clients_;
+    std::unordered_map<std::string, std::vector<mrg_slam_msgs::msg::PoseWithName>>               others_slam_poses_;
+    rclcpp::Subscription<mrg_slam_msgs::msg::PoseWithName>::SharedPtr                            slam_pose_broadcast_sub_;
+    rclcpp::Publisher<mrg_slam_msgs::msg::SlamStatus>::SharedPtr                                 slam_status_publisher_;
+    mrg_slam_msgs::msg::SlamStatus                                                               slam_status_msg_;
+    // other robot name -> accumulated dist when last graph update was requested from that robot
+    std::unordered_map<std::string, double> others_last_accum_dist_;
+    // other robot name -> unix seconds when last graph update was requested from that robot
+    std::unordered_map<std::string, double> others_last_graph_exchange_time_;
+
+    rclcpp::Subscription<mrg_slam_msgs::msg::PoseWithName>::SharedPtr   odom_broadcast_sub_;
+    rclcpp::Publisher<mrg_slam_msgs::msg::PoseWithName>::SharedPtr      odom_broadcast_pub_;
+    rclcpp::Publisher<mrg_slam_msgs::msg::PoseWithNameArray>::SharedPtr others_poses_pub_;
+
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr other_robots_removed_points_pub_;
+
+    std::mutex                                                         trans_odom2map_mutex_;
+    Eigen::Isometry3d                                                  trans_odom2map_;
+    rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr odom2map_pub_;
+    std::unordered_map<std::string, Eigen::Isometry3d>                 others_odom2map_;  // odom2map transform for other robots
+    std::unordered_map<std::string, std::pair<Eigen::Isometry3d, geometry_msgs::msg::Pose>> others_odom_poses_;
+
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_timer_pub_;    // timer based map cloud publisher
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_points_service_pub_;  // service based map cloud publisher
+
+    // Services
+    rclcpp::Service<mrg_slam_msgs::srv::AddStaticKeyFrames>::SharedPtr add_static_keyframes_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::SaveGraph>::SharedPtr          save_graph_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::LoadGraph>::SharedPtr          load_graph_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::SaveMap>::SharedPtr            save_map_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::PublishMap>::SharedPtr         publish_map_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::PublishGraph>::SharedPtr       publish_graph_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::RequestGraphs>::SharedPtr      request_graph_service_;
+    rclcpp::Service<mrg_slam_msgs::srv::GetGraphUuids>::SharedPtr      get_graph_uuids_service_;
+
+    // Processors
+    ImuProcessor         imu_processor_;
+    GpsProcessor         gps_processor_;
+    FloorCoeffsProcessor floor_coeffs_processor_;
+
+    MarkersPublisher markers_pub;
+
+    // latest point cloud map
+    std::mutex                               map_cloud_msg_mutex_;
+    sensor_msgs::msg::PointCloud2::SharedPtr map_cloud_msg_;
+    std::atomic_bool                         map_cloud_msg_update_required_;
+
+    // getting init pose from topic
+    std::mutex                                                       init_pose_mutex_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr         init_odom_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr init_pose_sub_;
+    geometry_msgs::msg::PoseStamped::ConstSharedPtr                  init_pose_msg_;
+
+    // for map cloud generation and graph publishing
+    std::string                        base_frame_id_;
+    std::string                        map_frame_id_;
+    std::string                        odom_frame_id_;
+    std::mutex                         snapshots_mutex_;
+    std::vector<KeyFrameSnapshot::Ptr> keyframes_snapshot_;
+    std::unique_ptr<MapCloudGenerator> map_cloud_generator_;
+
+    // More parameters
+    std::string              own_name_;
+    std::vector<std::string> multi_robot_names_;
+
+    // Timing statistics
+    std::vector<int64_t> loop_closure_times_;
+    std::vector<int64_t> graph_optimization_times_;
+    std::vector<int>     received_graph_bytes_;
+    std::vector<int>     sent_graph_bytes_;
+    int                  total_received_bytes_ = 0;
+
+    std::shared_ptr<AdaptiveCloudTransmitter> cloud_transmitter_;
+
+    // all the below members must be accessed after locking main_thread_mutex
+    std::mutex main_thread_mutex_;
+
+    std::unordered_map<std::string, std::pair<KeyFrame::ConstPtr, Eigen::Isometry3d>> others_prev_robot_keyframes_;
+
+    std::shared_ptr<GraphSLAM>       graph_slam_;
+    std::shared_ptr<GraphDatabase>   graph_database_;
+    std::unique_ptr<LoopDetector>    loop_detector_;
+    std::unique_ptr<KeyframeUpdater> keyframe_updater_;
+};
+
+}  // namespace mrg_slam
+
+// Register the component with class_loader.
+// This acts as a sort of entry point, allowing the component to be discoverable when its library
+// is being loaded into a running process.
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE( mrg_slam::MrgSlamComponent )

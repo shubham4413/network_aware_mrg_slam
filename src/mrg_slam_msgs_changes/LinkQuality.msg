@@ -1,0 +1,4 @@
+float64 distance_m
+float64 bandwidth_mbit
+float64 burst_kbit
+float64 latency_ms

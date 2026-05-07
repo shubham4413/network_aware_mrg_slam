@@ -1,0 +1,8 @@
+string robot_name
+uint32 original_bytes
+uint32 sent_bytes
+string tier_name
+float32 bandwidth_mbit
+float32 latency_ms
+uint64 total_original_bytes
+uint64 total_sent_bytes
