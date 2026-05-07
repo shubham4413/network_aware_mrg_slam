@@ -1,3 +1,6 @@
 [submodule "Multi-Robot-Graph-SLAM"]
 	path = Multi-Robot-Graph-SLAM
 	url = https://github.com/aserbremen/Multi-Robot-Graph-SLAM
+[submodule "mrg_slam"]
+	path = mrg_slam
+	url = https://github.com/aserbremen/Multi-Robot-Graph-SLAM.git
